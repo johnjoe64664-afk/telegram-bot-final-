@@ -1,4 +1,3 @@
-
 import json
 import os
 import time
@@ -252,12 +251,6 @@ def handle_broadcast_button(callback_query):
         })
 
     if not is_allowed_admin(user_id):
-        telegram("answerCallbackQuery", {
-            "callback_query_id": callback_id,
-            "text": "ဒီ Telegram account ကို Broadcast သုံးခွင့်မပေးထားပါ။ ALLOWED_ADMIN_IDS စစ်ပါ။",
-            "show_alert": True,
-        })
-        print("BROADCAST BUTTON DENIED:", user_id, flush=True)
         return
 
     state.setdefault("pending_broadcast_admins", {})[user_id] = True
