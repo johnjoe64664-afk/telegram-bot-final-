@@ -48,6 +48,8 @@ def load_state():
         return {
             "user_topics": {},
             "group_messages": {},
+            "pending_broadcast_admins": {},
+            "broadcast_button_message_id": None,
         }
 
     try:
@@ -56,6 +58,8 @@ def load_state():
 
         value.setdefault("user_topics", {})
         value.setdefault("group_messages", {})
+        value.setdefault("pending_broadcast_admins", {})
+        value.setdefault("broadcast_button_message_id", None)
         return value
 
     except Exception as error:
@@ -63,6 +67,8 @@ def load_state():
         return {
             "user_topics": {},
             "group_messages": {},
+            "pending_broadcast_admins": {},
+            "broadcast_button_message_id": None,
         }
 
 
@@ -113,10 +119,20 @@ def check_target_group():
 
 def topic_for_user(user):
     user_id = str(user["id"])
-    existing = state["user_topics"].get(user_id)
+    existing = state.setdefault("user_topics", {}).get(user_id)
 
     if existing:
         return int(existing)
+
+    # Recover the old topic from previous saved group-message mappings.
+    # This prevents a new topic when user_topics was partially lost.
+    for saved in state.get("group_messages", {}).values():
+        if str(saved.get("user_id")) == user_id and saved.get("thread_id"):
+            recovered_thread_id = int(saved["thread_id"])
+            state["user_topics"][user_id] = recovered_thread_id
+            save_state()
+            print("TOPIC RECOVERED:", user_id, recovered_thread_id, flush=True)
+            return recovered_thread_id
 
     topic = telegram(
         "createForumTopic",
@@ -193,69 +209,100 @@ def user_for_topic(thread_id):
     return None
 
 
-def is_allowed_admin(message):
-    """Return True only for configured admin Telegram user IDs."""
-    if not ADMIN_IDS:
-        print("BROADCAST BLOCKED: set ALLOWED_ADMIN_IDS first", flush=True)
-        return False
-
-    sender_id = str(message.get("from", {}).get("id", ""))
-    return sender_id in ADMIN_IDS
+def is_allowed_admin(message_or_user_id):
+    if isinstance(message_or_user_id, dict):
+        user_id = str(message_or_user_id.get("from", {}).get("id", ""))
+    else:
+        user_id = str(message_or_user_id)
+    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
 
 
-def broadcast_message(message):
-    """Send /broadcast <text> from General topic to all known customers."""
-    if not is_allowed_admin(message):
-        print(
-            "IGNORED BROADCAST: sender is not an allowed admin",
-            message.get("from", {}).get("id"),
-            flush=True,
-        )
+def ensure_broadcast_button():
+    """Show one Broadcast button in the group's General topic."""
+    if state.get("broadcast_button_message_id"):
         return
 
-    text = (message.get("text") or "").strip()
-    command, _, broadcast_text = text.partition(" ")
-    broadcast_text = broadcast_text.strip()
+    sent = telegram(
+        "sendMessage",
+        {
+            "chat_id": GROUP_ID,
+            "text": "Broadcast လုပ်ရန် အောက်က button ကိုနှိပ်ပါ။",
+            "reply_markup": json.dumps({
+                "inline_keyboard": [[{
+                    "text": "📢 Broadcast",
+                    "callback_data": "start_broadcast",
+                }]],
+            }),
+        },
+    )
+    state["broadcast_button_message_id"] = sent["message_id"]
+    save_state()
 
-    if not broadcast_text:
-        telegram(
-            "sendMessage",
-            {
-                "chat_id": GROUP_ID,
-                "text": "အသုံးပြုပုံ: /broadcast သင့်ရဲ့ စာသား",
-            },
-        )
+
+def handle_broadcast_button(callback_query):
+    user_id = str(callback_query.get("from", {}).get("id", ""))
+    callback_id = callback_query.get("id")
+
+    if callback_id:
+        telegram("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "Admin စစ်ဆေးနေပါတယ်...",
+            "show_alert": False,
+        })
+
+    if not is_allowed_admin(user_id):
         return
 
-    user_ids = list(state.get("user_topics", {}).keys())
-    success = 0
-    failed = 0
-
-    for user_id in user_ids:
-        try:
-            telegram(
-                "sendMessage",
-                {"chat_id": user_id, "text": broadcast_text},
-            )
-            success += 1
-            # Keep a small delay to reduce the chance of Telegram flood limits.
-            time.sleep(0.05)
-        except Exception as error:
-            failed += 1
-            print("BROADCAST SEND ERROR:", user_id, repr(error), flush=True)
+    state.setdefault("pending_broadcast_admins", {})[user_id] = True
+    save_state()
 
     telegram(
         "sendMessage",
         {
             "chat_id": GROUP_ID,
-            "text": (
-                "Broadcast ပြီးပါပြီ။\n"
-                f"အောင်မြင်: {success}\n"
-                f"မအောင်မြင်: {failed}"
-            ),
+            "text": "Broadcast ပို့မည့်စာကို ဒီ message ကို reply လုပ်ပြီး ပို့ပါ။",
+            "reply_markup": json.dumps({
+                "force_reply": True,
+                "input_field_placeholder": "Broadcast စာသားရေးပါ",
+            }),
         },
     )
-    print("BROADCAST DONE:", success, "success,", failed, "failed", flush=True)
+
+
+def send_broadcast_text(message, broadcast_text):
+    if not is_allowed_admin(message) or not broadcast_text.strip():
+        return
+
+    success = 0
+    failed = 0
+    for user_id in list(state.get("user_topics", {}).keys()):
+        try:
+            telegram("sendMessage", {
+                "chat_id": user_id,
+                "text": broadcast_text.strip(),
+            })
+            success += 1
+            time.sleep(0.05)
+        except Exception as error:
+            failed += 1
+            print("BROADCAST SEND ERROR:", user_id, repr(error), flush=True)
+
+    telegram("sendMessage", {
+        "chat_id": GROUP_ID,
+        "text": f"Broadcast ပြီးပါပြီ။\\nအောင်မြင်: {success}\\nမအောင်မြင်: {failed}",
+    })
+
+
+def broadcast_command(message):
+    text = (message.get("text") or "").strip()
+    _, _, broadcast_text = text.partition(" ")
+    if broadcast_text.strip():
+        send_broadcast_text(message, broadcast_text)
+    else:
+        telegram("sendMessage", {
+            "chat_id": GROUP_ID,
+            "text": "အသုံးပြုပုံ: /broadcast သင့်ရဲ့ စာသား",
+        })
 
 
 def reply_to_customer(message):
@@ -323,6 +370,10 @@ print("BOT STARTED", flush=True)
 print("GROUP_ID:", GROUP_ID, flush=True)
 print("STATE_FILE:", STATE_FILE, flush=True)
 check_target_group()
+try:
+    ensure_broadcast_button()
+except Exception as error:
+    print("BROADCAST BUTTON ERROR:", repr(error), flush=True)
 
 while True:
     try:
@@ -331,7 +382,7 @@ while True:
             params={
                 "offset": offset,
                 "timeout": 25,
-                "allowed_updates": json.dumps(["message"]),
+                "allowed_updates": json.dumps(["message", "callback_query"]),
             },
             timeout=35,
         )
@@ -345,6 +396,15 @@ while True:
 
         for update in data.get("result", []):
             offset = update["update_id"] + 1
+            callback_query = update.get("callback_query")
+            if callback_query:
+                try:
+                    if callback_query.get("data") == "start_broadcast":
+                        handle_broadcast_button(callback_query)
+                except Exception as error:
+                    print("CALLBACK ERROR:", repr(error), flush=True)
+                continue
+
             message = update.get("message")
 
             if not message:
@@ -361,21 +421,30 @@ while True:
                 except Exception as error:
                     print("FORWARD ERROR:", repr(error), flush=True)
 
-            # Admin can broadcast from the General topic with /broadcast text.
+            # Admin commands and replies in the target supergroup.
             elif chat_type == "supergroup" and chat_id == GROUP_ID:
                 try:
                     text = (message.get("text") or "").strip()
-                    thread_id = message.get("message_thread_id")
-
-                    # General topic messages have no message_thread_id.
-                    # Broadcast is intentionally disabled inside customer topics.
                     command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
-                    if command == "/broadcast" and not thread_id:
-                        broadcast_message(message)
+                    thread_id = message.get("message_thread_id")
+                    sender_id = str(message.get("from", {}).get("id", ""))
+
+                    # A pending button request accepts the next General-topic text.
+                    if (
+                        not thread_id
+                        and state.get("pending_broadcast_admins", {}).pop(sender_id, False)
+                        and text
+                        and not text.startswith("/")
+                    ):
+                        save_state()
+                        send_broadcast_text(message, text)
+                    elif command == "/broadcast" and not thread_id:
+                        broadcast_command(message)
                     else:
+                        # Original customer-topic reply flow remains unchanged.
                         reply_to_customer(message)
                 except Exception as error:
-                    print("GROUP MESSAGE ERROR:", repr(error), flush=True)
+                    print("REPLY ERROR:", repr(error), flush=True)
 
     except requests.RequestException as error:
         print("NETWORK ERROR:", repr(error), flush=True)
