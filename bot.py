@@ -10,6 +10,7 @@ TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 GROUP_ID = os.environ.get("GROUP_ID", "").strip()
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 STATE_FILE = DATA_DIR / "state.json"
+STATE_BACKUP_FILE = DATA_DIR / "state.backup.json"
 
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -64,6 +65,18 @@ def load_state():
 
     except Exception as error:
         print("STATE LOAD ERROR:", repr(error), flush=True)
+        if STATE_BACKUP_FILE.exists():
+            try:
+                with STATE_BACKUP_FILE.open("r", encoding="utf-8") as file:
+                    backup = json.load(file)
+                backup.setdefault("user_topics", {})
+                backup.setdefault("group_messages", {})
+                backup.setdefault("pending_broadcast_admins", {})
+                backup.setdefault("broadcast_button_message_id", None)
+                print("STATE RESTORED FROM BACKUP", flush=True)
+                return backup
+            except Exception as backup_error:
+                print("STATE BACKUP LOAD ERROR:", repr(backup_error), flush=True)
         return {
             "user_topics": {},
             "group_messages": {},
@@ -79,6 +92,9 @@ def save_state():
     with temporary.open("w", encoding="utf-8") as file:
         json.dump(state, file, ensure_ascii=False, indent=2)
 
+    # Keep the previous valid mapping as a recovery copy.
+    if STATE_FILE.exists():
+        STATE_FILE.replace(STATE_BACKUP_FILE)
     temporary.replace(STATE_FILE)
 
 
@@ -269,7 +285,7 @@ def handle_broadcast_button(callback_query):
     if not is_allowed_admin(user_id):
         telegram("answerCallbackQuery", {
             "callback_query_id": callback_id,
-            "text": "ဒီ Telegram account ကို Broadcast သုံးခွင့်မပေးထားပါ။ ALLOWED_ADMIN_IDS စစ်ပါ။",
+            "text": "ဒီ Telegram account က Group admin မဟုတ်ပါ။ Bot ကို Group admin ပေးပြီး ထပ်စမ်းပါ။",
             "show_alert": True,
         })
         print("BROADCAST BUTTON DENIED:", user_id, flush=True)
@@ -282,37 +298,98 @@ def handle_broadcast_button(callback_query):
         "sendMessage",
         {
             "chat_id": GROUP_ID,
-            "text": "Broadcast ပို့မည့်စာကို ဒီ message ကို reply လုပ်ပြီး ပို့ပါ။",
-            "reply_markup": json.dumps({
-                "force_reply": True,
-                "input_field_placeholder": "Broadcast စာသားရေးပါ",
-            }),
+            "text": "Broadcast စာသားကို အခုနောက် message တစ်ကြောင်းအနေနဲ့ တိုက်ရိုက်ပို့ပါ။ Reply လုပ်ရန်မလိုပါ။",
+            # No ForceReply: admin can send the next normal message directly.
         },
     )
 
 
-def send_broadcast_text(message, broadcast_text):
-    if not is_allowed_admin(message) or not broadcast_text.strip():
+def send_broadcast_report(success_ids, failed_items):
+    """Send a Telegram-size-safe per-customer delivery report to the group."""
+    lines = [
+        "Broadcast delivery report",
+        f"Total: {len(success_ids) + len(failed_items)}",
+        f"Success: {len(success_ids)}",
+        f"Failed: {len(failed_items)}",
+        "",
+    ]
+
+    for user_id in success_ids:
+        lines.append(f"✅ {user_id} - sent")
+
+    for user_id, error_text in failed_items:
+        lines.append(f"❌ {user_id} - failed: {error_text[:120]}")
+
+    # Telegram text messages have a 4096-character limit.
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3800:
+            telegram("sendMessage", {"chat_id": GROUP_ID, "text": chunk})
+            chunk = ""
+        chunk += line + "\n"
+
+    if chunk.strip():
+        telegram("sendMessage", {"chat_id": GROUP_ID, "text": chunk})
+
+
+def send_broadcast_message(source_message):
+    """Copy the next admin message to every known customer.
+
+    copyMessage supports text, photos, videos, GIF/animation, documents,
+    audio and other normal Telegram message types.
+    """
+    if not is_allowed_admin(source_message):
+        print("BROADCAST BLOCKED: sender is not a group admin", flush=True)
         return
 
-    success = 0
-    failed = 0
+    user_ids = list(state.get("user_topics", {}).keys())
+    success_ids = []
+    failed_items = []
+
+    if not user_ids:
+        telegram("sendMessage", {
+            "chat_id": GROUP_ID,
+            "text": "Broadcast မပို့နိုင်သေးပါ။ state.json ထဲမှာ customer မရှိသေးပါ။",
+        })
+        print("BROADCAST: no customers in state", flush=True)
+        return
+
+    for user_id in user_ids:
+        try:
+            telegram("copyMessage", {
+                "chat_id": user_id,
+                "from_chat_id": GROUP_ID,
+                "message_id": source_message["message_id"],
+            })
+            success_ids.append(user_id)
+            time.sleep(0.05)
+        except Exception as error:
+            error_text = str(error).replace("\n", " ")
+            failed_items.append((user_id, error_text))
+            print("BROADCAST SEND ERROR:", user_id, repr(error), flush=True)
+
+    send_broadcast_report(success_ids, failed_items)
+
+
+def send_broadcast_text(message, broadcast_text):
+    """Send a text command and produce the same per-customer report."""
+    if not broadcast_text.strip() or not is_allowed_admin(message):
+        return
+
+    success_ids = []
+    failed_items = []
     for user_id in list(state.get("user_topics", {}).keys()):
         try:
             telegram("sendMessage", {
                 "chat_id": user_id,
                 "text": broadcast_text.strip(),
             })
-            success += 1
-            time.sleep(0.05)
+            success_ids.append(user_id)
         except Exception as error:
-            failed += 1
-            print("BROADCAST SEND ERROR:", user_id, repr(error), flush=True)
+            failed_items.append((user_id, str(error).replace("\n", " ")))
+            print("BROADCAST TEXT ERROR:", user_id, repr(error), flush=True)
 
-    telegram("sendMessage", {
-        "chat_id": GROUP_ID,
-        "text": f"Broadcast ပြီးပါပြီ။\\nအောင်မြင်: {success}\\nမအောင်မြင်: {failed}",
-    })
+    send_broadcast_report(success_ids, failed_items)
 
 
 def broadcast_command(message):
@@ -448,15 +525,21 @@ while True:
                     thread_id = message.get("message_thread_id")
                     sender_id = str(message.get("from", {}).get("id", ""))
 
-                    # A pending button request accepts the next General-topic text.
+                    # A pending button request accepts the next normal message:
+                    # text, photo, video, animation/GIF, document, audio, etc.
+                    media_keys = (
+                        "photo", "video", "animation", "document", "audio",
+                        "voice", "video_note", "sticker"
+                    )
+                    has_content = bool(text or any(message.get(key) for key in media_keys))
+                    is_not_command = not text or not text.startswith("/")
                     if (
-                        not thread_id
-                        and state.get("pending_broadcast_admins", {}).pop(sender_id, False)
-                        and text
-                        and not text.startswith("/")
+                        state.get("pending_broadcast_admins", {}).pop(sender_id, False)
+                        and has_content
+                        and is_not_command
                     ):
                         save_state()
-                        send_broadcast_text(message, text)
+                        send_broadcast_message(message)
                     elif command == "/broadcast" and not thread_id:
                         broadcast_command(message)
                     else:
