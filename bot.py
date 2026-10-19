@@ -210,11 +210,27 @@ def user_for_topic(thread_id):
 
 
 def is_allowed_admin(message_or_user_id):
+    """Allow only Telegram group administrators/creator; no user ID env needed."""
     if isinstance(message_or_user_id, dict):
         user_id = str(message_or_user_id.get("from", {}).get("id", ""))
     else:
         user_id = str(message_or_user_id)
-    return bool(ADMIN_IDS) and user_id in ADMIN_IDS
+
+    if not user_id:
+        return False
+
+    try:
+        member = telegram(
+            "getChatMember",
+            {
+                "chat_id": GROUP_ID,
+                "user_id": user_id,
+            },
+        )
+        return member.get("status") in {"administrator", "creator"}
+    except Exception as error:
+        print("ADMIN CHECK ERROR:", repr(error), flush=True)
+        return False
 
 
 def ensure_broadcast_button():
@@ -251,6 +267,12 @@ def handle_broadcast_button(callback_query):
         })
 
     if not is_allowed_admin(user_id):
+        telegram("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "ဒီ Telegram account ကို Broadcast သုံးခွင့်မပေးထားပါ။ ALLOWED_ADMIN_IDS စစ်ပါ။",
+            "show_alert": True,
+        })
+        print("BROADCAST BUTTON DENIED:", user_id, flush=True)
         return
 
     state.setdefault("pending_broadcast_admins", {})[user_id] = True
@@ -312,16 +334,13 @@ def reply_to_customer(message):
     This intentionally does NOT require reply_to_message. The admin only
     needs to send a normal message inside the correct customer Topic.
     """
-    if ADMIN_IDS:
-        sender_id = str(message.get("from", {}).get("id", ""))
-
-        if sender_id not in ADMIN_IDS:
-            print(
-                "IGNORED: sender is not an allowed admin",
-                sender_id,
-                flush=True,
-            )
-            return
+    if not is_allowed_admin(message):
+        print(
+            "IGNORED: sender is not a group admin",
+            message.get("from", {}).get("id"),
+            flush=True,
+        )
+        return
 
     thread_id = message.get("message_thread_id")
 
