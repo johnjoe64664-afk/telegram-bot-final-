@@ -29,17 +29,31 @@ ADMIN_IDS = {
 
 
 def telegram(method, payload=None):
-    response = requests.post(
-        f"{API}/{method}",
-        data=payload or {},
-        timeout=35,
-    )
-    result = response.json()
+    """Call Telegram API and automatically retry flood-limit responses."""
+    for attempt in range(4):
+        response = requests.post(
+            f"{API}/{method}",
+            data=payload or {},
+            timeout=35,
+        )
+        result = response.json()
 
-    if not result.get("ok"):
+        if result.get("ok"):
+            return result["result"]
+
+        if result.get("error_code") == 429:
+            retry_after = int(result.get("parameters", {}).get("retry_after", 2))
+            print(
+                "TELEGRAM FLOOD LIMIT:", method,
+                "retrying after", retry_after, "seconds",
+                flush=True,
+            )
+            time.sleep(retry_after + 0.3)
+            continue
+
         raise RuntimeError(f"{method} failed: {result}")
 
-    return result["result"]
+    raise RuntimeError(f"{method} failed after flood-limit retries")
 
 
 def load_state():
@@ -298,7 +312,7 @@ def handle_broadcast_button(callback_query):
         "sendMessage",
         {
             "chat_id": GROUP_ID,
-            "text": "Broadcast စာသားကို အခုနောက် message တစ်ကြောင်းအနေနဲ့ တိုက်ရိုက်ပို့ပါ။ Reply လုပ်ရန်မလိုပါ။",
+            "text": "Broadcast mode ဖွင့်ပြီးပါပြီ။ စာ/ပုံ/ဗီဒီယို အများကြီး ဆက်ပို့နိုင်ပါတယ်။ ပြီးရင် /done ပို့ပါ။",
             # No ForceReply: admin can send the next normal message directly.
         },
     )
@@ -356,13 +370,25 @@ def send_broadcast_message(source_message):
 
     for user_id in user_ids:
         try:
+            # 1) Send the original message/media to the customer's private chat.
             telegram("copyMessage", {
                 "chat_id": user_id,
                 "from_chat_id": GROUP_ID,
                 "message_id": source_message["message_id"],
             })
+
+            # 2) Also show the same broadcast inside that customer's forum topic.
+            thread_id = state.get("user_topics", {}).get(str(user_id))
+            if thread_id:
+                telegram("copyMessage", {
+                    "chat_id": GROUP_ID,
+                    "message_thread_id": int(thread_id),
+                    "from_chat_id": GROUP_ID,
+                    "message_id": source_message["message_id"],
+                })
+
             success_ids.append(user_id)
-            time.sleep(0.05)
+            time.sleep(0.20)
         except Exception as error:
             error_text = str(error).replace("\n", " ")
             failed_items.append((user_id, error_text))
@@ -525,26 +551,33 @@ while True:
                     thread_id = message.get("message_thread_id")
                     sender_id = str(message.get("from", {}).get("id", ""))
 
-                    # A pending button request accepts the next normal message:
-                    # text, photo, video, animation/GIF, document, audio, etc.
-                    media_keys = (
-                        "photo", "video", "animation", "document", "audio",
-                        "voice", "video_note", "sticker"
-                    )
-                    has_content = bool(text or any(message.get(key) for key in media_keys))
-                    is_not_command = not text or not text.startswith("/")
-                    if (
-                        state.get("pending_broadcast_admins", {}).pop(sender_id, False)
-                        and has_content
-                        and is_not_command
-                    ):
+                    # Broadcast mode remains active until the admin sends /done.
+                    # Each next text/photo/video/GIF is broadcast and copied to the
+                    # matching customer's forum topic as an audit record.
+                    pending_broadcast = state.get("pending_broadcast_admins", {}).get(sender_id, False)
+                    if pending_broadcast and command in {"/done", "/broadcast_done"}:
+                        state.setdefault("pending_broadcast_admins", {}).pop(sender_id, None)
                         save_state()
-                        send_broadcast_message(message)
-                    elif command == "/broadcast" and not thread_id:
-                        broadcast_command(message)
+                        telegram("sendMessage", {
+                            "chat_id": GROUP_ID,
+                            "text": "Broadcast mode ပိတ်လိုက်ပါပြီ။",
+                        })
                     else:
-                        # Original customer-topic reply flow remains unchanged.
-                        reply_to_customer(message)
+                        media_keys = (
+                            "photo", "video", "animation", "document", "audio",
+                            "voice", "video_note", "sticker"
+                        )
+                        has_content = bool(text or any(message.get(key) for key in media_keys))
+                        is_not_command = not text or not text.startswith("/")
+                        if pending_broadcast and not thread_id and has_content and is_not_command:
+                            # Broadcast mode is only active in General topic.
+                            # Customer-topic messages remain normal replies.
+                            send_broadcast_message(message)
+                        elif command == "/broadcast" and not thread_id:
+                            broadcast_command(message)
+                        else:
+                            # Original customer-topic reply flow remains unchanged.
+                            reply_to_customer(message)
                 except Exception as error:
                     print("REPLY ERROR:", repr(error), flush=True)
 
