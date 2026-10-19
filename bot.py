@@ -193,6 +193,71 @@ def user_for_topic(thread_id):
     return None
 
 
+def is_allowed_admin(message):
+    """Return True only for configured admin Telegram user IDs."""
+    if not ADMIN_IDS:
+        print("BROADCAST BLOCKED: set ALLOWED_ADMIN_IDS first", flush=True)
+        return False
+
+    sender_id = str(message.get("from", {}).get("id", ""))
+    return sender_id in ADMIN_IDS
+
+
+def broadcast_message(message):
+    """Send /broadcast <text> from General topic to all known customers."""
+    if not is_allowed_admin(message):
+        print(
+            "IGNORED BROADCAST: sender is not an allowed admin",
+            message.get("from", {}).get("id"),
+            flush=True,
+        )
+        return
+
+    text = (message.get("text") or "").strip()
+    command, _, broadcast_text = text.partition(" ")
+    broadcast_text = broadcast_text.strip()
+
+    if not broadcast_text:
+        telegram(
+            "sendMessage",
+            {
+                "chat_id": GROUP_ID,
+                "text": "အသုံးပြုပုံ: /broadcast သင့်ရဲ့ စာသား",
+            },
+        )
+        return
+
+    user_ids = list(state.get("user_topics", {}).keys())
+    success = 0
+    failed = 0
+
+    for user_id in user_ids:
+        try:
+            telegram(
+                "sendMessage",
+                {"chat_id": user_id, "text": broadcast_text},
+            )
+            success += 1
+            # Keep a small delay to reduce the chance of Telegram flood limits.
+            time.sleep(0.05)
+        except Exception as error:
+            failed += 1
+            print("BROADCAST SEND ERROR:", user_id, repr(error), flush=True)
+
+    telegram(
+        "sendMessage",
+        {
+            "chat_id": GROUP_ID,
+            "text": (
+                "Broadcast ပြီးပါပြီ။\n"
+                f"အောင်မြင်: {success}\n"
+                f"မအောင်မြင်: {failed}"
+            ),
+        },
+    )
+    print("BROADCAST DONE:", success, "success,", failed, "failed", flush=True)
+
+
 def reply_to_customer(message):
     """
     Send any admin message from a customer Topic back to that customer.
@@ -296,12 +361,21 @@ while True:
                 except Exception as error:
                     print("FORWARD ERROR:", repr(error), flush=True)
 
-            # Admin sends a normal message in the matching customer Topic.
+            # Admin can broadcast from the General topic with /broadcast text.
             elif chat_type == "supergroup" and chat_id == GROUP_ID:
                 try:
-                    reply_to_customer(message)
+                    text = (message.get("text") or "").strip()
+                    thread_id = message.get("message_thread_id")
+
+                    # General topic messages have no message_thread_id.
+                    # Broadcast is intentionally disabled inside customer topics.
+                    command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+                    if command == "/broadcast" and not thread_id:
+                        broadcast_message(message)
+                    else:
+                        reply_to_customer(message)
                 except Exception as error:
-                    print("REPLY ERROR:", repr(error), flush=True)
+                    print("GROUP MESSAGE ERROR:", repr(error), flush=True)
 
     except requests.RequestException as error:
         print("NETWORK ERROR:", repr(error), flush=True)
